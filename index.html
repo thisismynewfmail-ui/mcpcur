@@ -2490,16 +2490,26 @@ const Speech = {
   _raw: '', _spokenLen: 0,           // per-turn piper segmentation state
   _gen: 0, _jobs: [],                // ordered prefetch/playback queue
   _playing: false, _cur: null, _warned: false, _failed: false,
+  _pendingStop: false,               // root turn: cut prior speech on first new text, not on box appear
 
   engine() { return state.settings.ttsEngine === 'piper' ? 'piper' : 'sfx'; },
   enabled() { return !!state.settings.soundEnabled; },
 
-  beginTurn() { this.stop(); this._raw = ''; this._spokenLen = 0; this._warned = false; this._failed = false; },
+  // root === true marks a fresh user turn (vs. a tool-call recursion round).
+  // We do NOT stop here: a root turn defers the cut-off until the first text
+  // actually streams (see feed), and a recursion round must keep the earlier
+  // round's audio playing so tool calls never chop the voice mid-sentence.
+  beginTurn(root) {
+    this._raw = ''; this._spokenLen = 0; this._warned = false; this._failed = false;
+    if (root) this._pendingStop = true;
+  },
   endTurn() { if (this.enabled() && this.engine() === 'piper') this._pump(true); },
 
   feed(delta) {
     if (!delta || !this.enabled()) return;
-    if (this.engine() === 'sfx') { for (const ch of delta) SFX.blip(ch); return; }
+    if (this.engine() === 'sfx') { this._pendingStop = false; for (const ch of delta) SFX.blip(ch); return; }
+    // First real text of a new root turn → only now cut the previous reply's audio.
+    if (this._pendingStop) { this._pendingStop = false; this.stop(); }
     this._raw += delta;
     this._pump(false);
   },
@@ -2611,6 +2621,7 @@ const Speech = {
 
   stop() {
     this._gen++;
+    this._pendingStop = false;
     for (const j of this._jobs) if (j.url) { try { URL.revokeObjectURL(j.url); } catch {} }
     this._jobs = [];
     if (this._cur) { try { this._cur.pause(); } catch {} this._cur = null; }
@@ -3100,7 +3111,7 @@ async function runTurn(depth = 0) {
   const body = buildOutgoing();
   const ai = { role: 'assistant', content: '', reasoning: '', tool_calls: [], _ts: Date.now(), _streaming: true };
   state.messages.push(ai); renderMessages();
-  Speech.beginTurn();
+  Speech.beginTurn(depth === 0);
   state.status.streaming = true;
   $('btn-send').textContent = 'STOP'; $('btn-send').classList.add('stop');
   $('streaming-indicator').textContent = '◢ RECEIVING…';
