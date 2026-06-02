@@ -1,0 +1,10 @@
+# Piper voice models and generated previews are large / machine-local.
+# Keep them out of version control; the folder + docs stay tracked.
+*.onnx
+*.onnx.json
+*.json
+/previews/*.wav
+
+# but keep the docs and this file
+!README.md
+!.gitignore
