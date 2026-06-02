@@ -124,7 +124,15 @@ class MCPClient:
                 stderr=subprocess.PIPE,
                 env=full_env,
                 cwd=self.cwd,
-                bufsize=0,
+                # bufsize=-1 (default, buffered) is critical here. With bufsize=0
+                # stdout is a raw FileIO whose readline() falls back to reading one
+                # byte per syscall — so a single large JSON-RPC line (e.g. a
+                # Playwright `browser_snapshot`, which can be hundreds of KB to
+                # several MB of accessibility tree) takes ~50x longer to read and
+                # the tool call appears to hang ("stops generating"). A
+                # BufferedReader reads the whole line in one shot. We always
+                # flush() stdin manually in _send(), so buffered stdin is safe.
+                bufsize=-1,
             )
             self._reader = threading.Thread(target=self._read_loop, name=f"mcp-{self.name}-out", daemon=True)
             self._reader.start()
@@ -1227,6 +1235,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── LLM proxy (SSE-aware) ──
 
+    def _stream_notice(self, msg: str):
+        """Inject a visible message into an in-flight SSE stream, then close it.
+
+        Headers are already sent (200 / text/event-stream) by the time we hit a
+        mid-stream failure, so we can't change the status code. Emit an
+        OpenAI-style delta chunk (which the UI renders) followed by [DONE] so the
+        browser surfaces the error instead of the response appearing to just
+        stop."""
+        try:
+            chunk = {"choices": [{"delta": {"content": f"\n\n_[proxy: {msg}]_"}}]}
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode("utf-8"))
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except Exception:
+            pass
+
     def _proxy_llm(self, body: dict):
         url = body.get("url")
         headers = body.get("headers") or {}
@@ -1262,6 +1286,14 @@ class Handler(BaseHTTPRequestHandler):
                         try:
                             chunk = resp.read(512)
                         except (TimeoutError, socket.timeout):
+                            # Upstream stalled (e.g. very long time-to-first-token
+                            # after a huge tool result). Don't silently truncate the
+                            # SSE stream — surface it as a visible delta so the UI
+                            # shows the failure instead of appearing to "stop".
+                            self._stream_notice(f"upstream stream timed out after {timeout:g}s")
+                            break
+                        except (urllib.error.URLError, ConnectionError, OSError) as e:
+                            self._stream_notice(f"upstream stream error: {type(e).__name__}: {e}")
                             break
                         if not chunk:
                             break
